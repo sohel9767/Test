@@ -1,0 +1,117 @@
+import os
+import requests
+from datetime import datetime, timedelta, timezone
+
+TENANT_ID = os.environ["TENANT_ID"]
+CLIENT_ID = os.environ["CLIENT_ID"]
+CLIENT_SECRET = os.environ["CLIENT_SECRET"]
+
+# Threshold for expiration (e.g., 30 days)
+THRESHOLD_DAYS = 30
+HTML_OUTPUT_FILE = "expiring_secrets_report.html"
+
+def get_token():
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials"
+    }
+    response = requests.post(url, headers=headers, data=data)
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+def get_app_registrations(token):
+    url = "https://graph.microsoft.com/v1.0/applications?$select=displayName,appId,passwordCredentials"
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json().get("value", [])
+
+def check_expiring_secrets(apps):
+    expiring_secrets = []
+    threshold_date = datetime.now(timezone.utc) + timedelta(days=THRESHOLD_DAYS)
+
+    for app in apps:
+        display_name = app.get("displayName")
+        app_id = app.get("appId")
+        for secret in app.get("passwordCredentials", []):
+            end_date_str = secret.get("endDateTime")
+            expiry = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+            if expiry <= threshold_date:
+                expiring_secrets.append({
+                    "DisplayName": display_name,
+                    "AppId": app_id,
+                    "SecretExpiry": expiry.isoformat()
+                })
+    return expiring_secrets
+
+def generate_html_report(secrets):
+    html = """
+    <html>
+    <head>
+        <style>
+            table {
+                border-collapse: collapse;
+                width: 100%;
+            }
+            th, td {
+                border: 1px solid #ddd;
+                padding: 8px;
+            }
+            th {
+                background-color: #f2f2f2;
+                text-align: left;
+            }
+            tr:nth-child(even) {
+                background-color: #f9f9f9;
+            }
+        </style>
+    </head>
+    <body>
+        <h2>Azure App Registration Secrets Expiring Soon</h2>
+        <table>
+            <tr>
+                <th>Display Name</th>
+                <th>App ID</th>
+                <th>Secret Expiry</th>
+            </tr>
+    """
+
+    for secret in secrets:
+        html += f"""
+            <tr>
+                <td>{secret['DisplayName']}</td>
+                <td>{secret['AppId']}</td>
+                <td>{secret['SecretExpiry']}</td>
+            </tr>
+        """
+
+    html += """
+        </table>
+    </body>
+    </html>
+    """
+    return html
+
+def save_html_report(html, filename):
+    with open(filename, "w") as file:
+        file.write(html)
+
+def main():
+    token = get_token()
+    apps = get_app_registrations(token)
+    expiring_secrets = check_expiring_secrets(apps)
+
+    if not expiring_secrets:
+        print("✅ No secrets expiring within threshold.")
+    else:
+        print(f"⚠️ {len(expiring_secrets)} secrets expiring soon. Generating report...")
+        html = generate_html_report(expiring_secrets)
+        save_html_report(html, HTML_OUTPUT_FILE)
+        print(f"📄 Report saved to {HTML_OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
