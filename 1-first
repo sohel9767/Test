@@ -1,0 +1,129 @@
+import requests
+import smtplib
+import os
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+# Config
+TENANT_ID = os.environ['TENANT_ID']
+CLIENT_ID = os.environ['CLIENT_ID']
+CLIENT_SECRET = os.environ['CLIENT_SECRET']
+SMTP_SERVER = os.environ['SMTP_SERVER']
+SMTP_PORT = int(os.environ.get('SMTP_PORT', 25))
+SENDER_EMAIL = os.environ['SENDER_EMAIL']
+RECIPIENT_EMAILS = os.environ['RECIPIENT_EMAILS'].split(";")
+
+EXPIRY_DAYS = 30
+GRAPH_API_VERSION = 'v1.0'
+
+# Authenticate and get access token
+def get_access_token():
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    headers = { "Content-Type": "application/x-www-form-urlencoded" }
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "scope": "https://graph.microsoft.com/.default"
+    }
+    response = requests.post(url, headers=headers, data=data)
+    response.raise_for_status()
+    return response.json()['access_token']
+
+# Get all app registrations
+def get_app_registrations(token):
+    url = f"https://graph.microsoft.com/{GRAPH_API_VERSION}/applications"
+    headers = {"Authorization": f"Bearer {token}"}
+    apps = []
+    while url:
+        res = requests.get(url, headers=headers)
+        res.raise_for_status()
+        data = res.json()
+        apps.extend(data.get('value', []))
+        url = data.get('@odata.nextLink')
+    return apps
+
+# Get owners for a specific app
+def get_app_owners(token, app_id):
+    url = f"https://graph.microsoft.com/{GRAPH_API_VERSION}/applications/{app_id}/owners"
+    headers = {"Authorization": f"Bearer {token}"}
+    res = requests.get(url, headers=headers)
+    res.raise_for_status()
+    return [owner.get('userPrincipalName', 'N/A') for owner in res.json().get('value', [])]
+
+# Build HTML table
+def build_html_table(rows):
+    html = """
+    <html><body>
+    <p>The following app registration secrets are expiring within the next 30 days:</p>
+    <table border="1" cellpadding="5" cellspacing="0">
+        <tr>
+            <th>App Display Name</th>
+            <th>App ID</th>
+            <th>Owners</th>
+            <th>Secret Expiry Date</th>
+        </tr>
+    """
+    for row in rows:
+        html += f"""
+        <tr>
+            <td>{row['displayName']}</td>
+            <td>{row['appId']}</td>
+            <td>{'<br>'.join(row['owners'])}</td>
+            <td>{row['expiryDate']}</td>
+        </tr>
+        """
+    html += "</table></body></html>"
+    return html
+
+# Send email
+def send_email(subject, html_content):
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = ", ".join(RECIPIENT_EMAILS)
+    msg.attach(MIMEText(html_content, 'html'))
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.sendmail(SENDER_EMAIL, RECIPIENT_EMAILS, msg.as_string())
+
+# Main logic
+def main():
+    token = get_access_token()
+    apps = get_app_registrations(token)
+    report_rows = []
+
+    threshold_date = datetime.utcnow() + timedelta(days=EXPIRY_DAYS)
+
+    for app in apps:
+        app_id = app['id']
+        display_name = app.get('displayName', 'N/A')
+        app_identifier = app.get('appId', 'N/A')
+
+        # Get passwords (client secrets)
+        secrets_url = f"https://graph.microsoft.com/{GRAPH_API_VERSION}/applications/{app_id}/passwordCredentials"
+        headers = {"Authorization": f"Bearer {token}"}
+        res = requests.get(secrets_url, headers=headers)
+        res.raise_for_status()
+
+        for secret in res.json().get('value', []):
+            expiry = datetime.strptime(secret['endDateTime'], '%Y-%m-%dT%H:%M:%SZ')
+            if expiry <= threshold_date:
+                owners = get_app_owners(token, app_id)
+                report_rows.append({
+                    'displayName': display_name,
+                    'appId': app_identifier,
+                    'owners': owners,
+                    'expiryDate': expiry.strftime('%Y-%m-%d')
+                })
+
+    if report_rows:
+        html = build_html_table(report_rows)
+        send_email("⚠️ Azure App Registration Secrets Expiring Soon", html)
+        print("Email sent with expiring secrets.")
+    else:
+        print("No secrets expiring in the next 30 days.")
+
+if __name__ == '__main__':
+    main()
