@@ -1,0 +1,67 @@
+import os
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+
+# ServiceNow config (set these in pipeline/env)
+SERVICENOW_INSTANCE = os.environ.get("SERVICENOW_INSTANCE")
+SERVICENOW_USER = os.environ.get("SERVICENOW_USER")
+SERVICENOW_PASSWORD = os.environ.get("SERVICENOW_PASSWORD")
+DEFAULT_ASSIGNEE = os.environ.get("DEFAULT_ASSIGNEE", "service_account_user@example.com")
+
+HTML_FILE = "expiring_secrets_report.html"
+
+def extract_expiring_secrets():
+    with open(HTML_FILE, "r") as f:
+        soup = BeautifulSoup(f, "html.parser")
+
+    rows = soup.find_all("tr")[1:]  # Skip header
+    expiring = []
+
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) < 4:
+            continue
+        app_name = cols[0].text.strip()
+        secret_name = cols[1].text.strip()
+        expiry = cols[2].text.strip()
+        owner = cols[3].text.strip() or DEFAULT_ASSIGNEE
+
+        expiry_date = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        if (expiry_date - datetime.utcnow()).days <= 30:
+            expiring.append((app_name, secret_name, expiry, owner))
+
+    return expiring
+
+def create_snow_ticket(app_name, secret_name, expiry, owner):
+    url = f"https://{SERVICENOW_INSTANCE}.service-now.com/api/now/table/incident"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    data = {
+        "short_description": f"Secret Expiry Alert: {secret_name} for {app_name}",
+        "description": f"The secret **{secret_name}** for application **{app_name}** is expiring on **{expiry}**.\n\nPlease take action.",
+        "caller_id": owner,
+        "urgency": "2",  # Medium
+        "impact": "2",   # Medium
+        "category": "security"
+    }
+
+    response = requests.post(url, auth=(SERVICENOW_USER, SERVICENOW_PASSWORD), headers=headers, json=data)
+    if response.status_code == 201:
+        print(f"[✓] Created ticket for {app_name}/{secret_name}")
+    else:
+        print(f"[!] Failed to create ticket: {response.status_code} - {response.text}")
+
+def main():
+    secrets = extract_expiring_secrets()
+    if not secrets:
+        print("No secrets expiring within 30 days.")
+        return
+
+    for app_name, secret_name, expiry, owner in secrets:
+        create_snow_ticket(app_name, secret_name, expiry, owner)
+
+if __name__ == "__main__":
+    main()
