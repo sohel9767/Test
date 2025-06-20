@@ -1,0 +1,82 @@
+import os
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+
+# Config
+SERVICENOW_INSTANCE = os.environ.get("SERVICENOW_INSTANCE")
+SERVICENOW_USER = os.environ.get("SERVICENOW_USER")
+SERVICENOW_PASSWORD = os.environ.get("SERVICENOW_PASSWORD")
+DEFAULT_ASSIGNEE = os.environ.get("DEFAULT_ASSIGNEE", "service_account_user@example.com")
+
+HTML_FILE = "expiring_secrets_report.html"
+
+def extract_expiring_secrets():
+    with open(HTML_FILE, "r") as f:
+        soup = BeautifulSoup(f, "html.parser")
+
+    rows = soup.find_all("tr")[1:]  # Skip header
+    expiring = []
+
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) < 4:
+            continue
+        app_name = cols[0].text.strip()
+        secret_name = cols[1].text.strip()
+        expiry = cols[2].text.strip()
+        owner = cols[3].text.strip() or DEFAULT_ASSIGNEE
+
+        try:
+            expiry_date = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        except:
+            continue
+
+        if (expiry_date - datetime.utcnow()).days <= 30:
+            expiring.append((app_name, secret_name, expiry, owner))
+
+    return expiring
+
+def create_snow_ticket(app_name, secret_name, expiry, owner):
+    url = f"https://{SERVICENOW_INSTANCE}.service-now.com/api/now/v1/table/incident"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    # Replace these fields with actual working values or pull dynamically if needed
+    data = {
+        "template_name": "X86 Platform Support Abend Program Error",
+        "fields": {
+            "caller_id": owner,  # Or use a user ID like "c7b9r"
+            "location": "USANY02000:New York",
+            "cmdb_ci": "serial_number=QT6777CN4W",
+            "assignment_group": "Cloud CoE Azure Engineering",  # You may need the sys_id if required
+            "contact_type": "Email",
+            "u_inc_cat": "Application Support > BPS > Facets > Table Update Request-Other",
+            "short_description": f"[Secret Expiry] {secret_name} in {app_name}",
+            "description": f"The secret **{secret_name}** for application **{app_name}** is expiring on **{expiry}**.\n\nPlease rotate or renew as necessary.",
+            "u_what_s_impacted": "Application or Software",
+            "u_magnitude_of_impact": "Single User",
+            "u_impact_of_use": "Minimal Impact",
+            "u_functionality_importance": "Non-Production / Test"
+        }
+    }
+
+    response = requests.post(url, auth=(SERVICENOW_USER, SERVICENOW_PASSWORD), headers=headers, json=data)
+    if response.status_code == 201:
+        print(f"[✓] Ticket created for {app_name}/{secret_name}")
+    else:
+        print(f"[!] Failed to create SNOW ticket: {response.status_code} - {response.text}")
+
+def main():
+    secrets = extract_expiring_secrets()
+    if not secrets:
+        print("✅ No expiring secrets found within 30 days.")
+        return
+
+    for app_name, secret_name, expiry, owner in secrets:
+        create_snow_ticket(app_name, secret_name, expiry, owner)
+
+if __name__ == "__main__":
+    main()
